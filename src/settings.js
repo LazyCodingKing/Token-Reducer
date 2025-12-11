@@ -106,6 +106,12 @@ export let settings = { ...defaultSettings };
  * @param {string} message - The notification message
  * @param {string} title - Optional title
  */
+/**
+ * Show notification if allowed by settings
+ * @param {string} type - 'success', 'info', 'warning', 'error'
+ * @param {string} message - The notification message
+ * @param {string} title - Optional title
+ */
 export function notify(type, message, title = 'Token Reducer') {
     // Errors always show unless notifications are completely off
     if (settings.show_notifications === 'none') return;
@@ -115,25 +121,29 @@ export function notify(type, message, title = 'Token Reducer') {
         if (type !== 'error' && type !== 'warning') return;
     }
 
-    // Show the notification
-    switch (type) {
-        case 'success':
-            notify("success", message, title);
-            break;
-        case 'info':
-            notify("info", message, title);
-            break;
-        case 'warning':
-            notify("warning", message, title);
-            break;
-        case 'error':
-            notify("error", message, title);
-            break;
-        default:
-            notify("info", message, title);
+    // Show the notification using the global toastr object
+    // FIX: Use toastr instead of recursively calling notify()
+    if (typeof toastr !== 'undefined') {
+        switch (type) {
+            case 'success':
+                toastr.success(message, title);
+                break;
+            case 'info':
+                toastr.info(message, title);
+                break;
+            case 'warning':
+                toastr.warning(message, title);
+                break;
+            case 'error':
+                toastr.error(message, title);
+                break;
+            default:
+                toastr.info(message, title);
+        }
+    } else {
+        console.log(`[${title}] ${type}: ${message}`);
     }
 }
-
 /**
  * Load settings from extension storage
  */
