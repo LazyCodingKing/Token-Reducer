@@ -4,9 +4,13 @@
 
 import { getContext, extension_settings } from "../../../../extensions.js";
 import { createWorldInfoEntry, createNewWorldInfo, METADATA_KEY, world_names, loadWorldInfo, saveWorldInfo, reloadEditor, updateWorldInfoList } from "../../../../world-info.js";
-import { chat_metadata, saveMetadata } from "../../../../../script.js";
+import { chat_metadata, saveMetadata, setExtensionPrompt, extension_prompt_types, extension_prompt_roles } from "../../../../../script.js";
 import { settings, notify } from "./settings.js";
-import { generateKeywords } from "./summarizer.js";
+import { generateKeywords, summarizeScene } from "./summarizer.js"; // Import summarizeScene
+
+const RETRIEVAL_INJECT_KEY = 'tr_retrieval_injection';
+
+
 
 // In-memory cache of memories for current chat
 let memoryCache = [];
@@ -481,12 +485,26 @@ async function storeToLorebook(summary, keywords, options = {}) {
 /**
  * Retrieve memories relevant to the current context
  */
+/**
+ * Retrieve memories relevant to the current context
+ */
 export async function retrieveRelevantMemories(queryText = null) {
     const context = getContext();
     const chat = context.chat;
 
+    // Smart Retrieval: Generate query using LLM if enabled
+    if (settings.enable_llm_retrieval && !queryText) {
+        // Use last 10 messages for context
+        const history = chat.slice(-10).map(m => `${m.name}: ${m.mes}`).join('\n');
+        const llmQuery = await generateRetrievalQuery(history);
+        if (llmQuery) {
+            console.log(`Token Reducer: Generated retrieval query: "${llmQuery}"`);
+            queryText = llmQuery;
+        }
+    }
+
     if (!queryText) {
-        // Use the last user message as query
+        // Fallback: Use the last user message as query
         for (let i = chat.length - 1; i >= 0; i--) {
             if (chat[i].is_user && !chat[i].is_system) {
                 queryText = chat[i].mes;
@@ -549,6 +567,16 @@ export async function injectMemoriesIntoContext() {
         context.chatMetadata.tr_injected_memories = [];
     }
     context.chatMetadata.tr_injected_memories = memoryText;
+
+    // Use setExtensionPrompt to actually inject into the generation context
+    setExtensionPrompt(
+        RETRIEVAL_INJECT_KEY,
+        memoryText,
+        extension_prompt_types.IN_CHAT,
+        settings.injection_depth || 0, // Reuse timeline depth or add new setting? defaulting to timeline depth for now
+        false, // scan for WI
+        settings.injection_role || extension_prompt_roles.SYSTEM
+    );
 
     console.log(`Token Reducer: Injecting ${memories.length} memories`);
 
@@ -628,5 +656,208 @@ export async function importMemories(jsonData) {
         console.error('Token Reducer: Import failed:', err);
         notify("error", 'Failed to import memories', 'Token Reducer');
         return 0;
+    }
+}
+/**
+ * Generate a concise summary for a block of text
+ */
+async function generateSummary(text) {
+    if (!text || !text.trim()) return null;
+
+    const prompt = settings.summary_prompt.replace('{{content}}', text);
+
+    try {
+        const result = await ConnectionManagerRequestService.sendRequest(
+            settings.summarization_profile,
+            [{ role: 'user', content: prompt }]
+        );
+        return result?.content || result;
+    } catch (err) {
+        console.error('Token Reducer: Summary generation failed', err);
+        return null;
+    }
+}
+
+
+
+// Re-implementing correctly with ID injection
+async function performArcAnalysis() {
+    const context = getContext();
+    const chat = context.chat;
+    const lastSceneEnd = getLastSceneEnd();
+    const startIndex = lastSceneEnd === -1 ? 0 : lastSceneEnd + 1;
+
+    if (chat.length - startIndex < 5) {
+        notify('warning', 'Not enough messages to analyze.', 'Token Reducer');
+        return null;
+    }
+
+    // Get unchaptered messages with REAL IDs
+    const messages = [];
+    for (let i = startIndex; i < chat.length; i++) {
+        messages.push({
+            id: i,
+            name: chat[i].name,
+            text: chat[i].mes
+        });
+    }
+
+    // Limit to reasonable size for context (last 100)
+    const analysisWindow = messages.slice(-100);
+
+    const historyText = analysisWindow.map(m =>
+        `[ID: ${m.id}] ${m.name}: ${m.text.substring(0, 300)}`
+    ).join('\n');
+
+    // Get timeline summary for context
+    const timeline = getChapterTimeline().map(c => `Chapter ${c.id}: ${c.summary}`).join('\n\n');
+    let prompt = settings.arc_analyzer_prompt_template.replace('{{chapterHistory}}', historyText);
+    prompt = prompt.replace('{{timeline}}', timeline);
+
+    try {
+        notify('info', 'Analyzing story arcs...', 'Token Reducer');
+
+        // Use summarization profile (or arc profile if we added it, but let's reuse summarization for simplicity)
+        const profile = settings.summarization_profile;
+        if (!profile) throw new Error('No summarization profile selected in settings.');
+
+        const response = await ConnectionManagerRequestService.sendRequest(
+            profile,
+            [{ role: 'user', content: prompt }]
+        );
+
+        const content = response?.content || response;
+        console.log('Token Reducer: Arc Analysis Response:', content);
+
+        // Robust JSON extraction
+        let jsonStr = content;
+        if (content.includes('```json')) {
+            jsonStr = content.split('```json')[1].split('```')[0];
+        } else if (content.includes('```')) {
+            jsonStr = content.split('```')[1].split('```')[0];
+        }
+
+        // Find array bracket
+        const start = jsonStr.indexOf('[');
+        const end = jsonStr.lastIndexOf(']');
+        if (start !== -1 && end !== -1) {
+            jsonStr = jsonStr.substring(start, end + 1);
+        }
+
+        const arcs = JSON.parse(jsonStr);
+        return arcs; // Returns array of { title, summary, chapterEnd ... }
+
+    } catch (err) {
+        throw err;
+    }
+}
+
+/**
+ * Show the Arc Analyzer Popup
+ * @param {Array} arcs
+ */
+export async function showArcPopup(arcs) {
+    if (!arcs || arcs.length === 0) {
+        notify('info', 'No story arcs detected.', 'Token Reducer');
+        return;
+    }
+
+    // Create Overlay
+    const overlay = $(`<div class="rmr-arc-popup-overlay"></div>`);
+
+    // Create Popup Content
+    const popup = $(`
+        <div class="rmr-arc-popup">
+            <div class="rmr-arc-popup-header">
+                <span class="rmr-arc-popup-title">Story Arc Analyzer</span>
+                <button class="rmr-arc-popup-close">×</button>
+            </div>
+            <div class="rmr-arc-popup-body">
+                <div class="rmr-arc-list"></div>
+            </div>
+        </div>
+    `);
+
+    const list = popup.find('.rmr-arc-list');
+
+    // Populate List
+    arcs.forEach(arc => {
+        const item = $(`
+            <div class="rmr-arc-item">
+                <div class="rmr-arc-item-header">
+                    <span class="rmr-arc-item-title">${arc.title}</span>
+                    <span class="rmr-arc-item-meta">End ID: ${arc.chapterEnd}</span>
+                </div>
+                <div class="rmr-arc-item-summary">${arc.summary}</div>
+                <div class="rmr-arc-item-justification">Analysis: ${arc.justification}</div>
+                <button class="rmr-arc-item-btn">Create Chapter Here</button>
+            </div>
+        `);
+
+        // Button Logic
+        item.find('.rmr-arc-item-btn').on('click', async function () {
+            const btn = $(this);
+            btn.prop('disabled', true).text('Summarizing...');
+
+            try {
+                // Call summarizeScene from summarizer.js
+                // We need to determine start ID.
+                // It's strictly lastSceneEnd + 1
+                const lastEnd = getLastSceneEnd();
+                const startId = lastEnd + 1;
+
+                await summarizeScene(startId, arc.chapterEnd);
+
+                btn.text('✓ Completed').addClass('completed');
+                item.addClass('completed');
+                notify('success', `Chapter created: ${arc.title}`, 'Token Reducer');
+            } catch (err) {
+                console.error(err);
+                notify('error', 'Failed to create chapter: ' + err.message, 'Token Reducer');
+                btn.prop('disabled', false).text('Create Chapter Here');
+            }
+        });
+
+        list.append(item);
+    });
+
+    // Close Logic
+    popup.find('.rmr-arc-popup-close').on('click', () => overlay.remove());
+    overlay.on('click', (e) => {
+        if ($(e.target).is('.rmr-arc-popup-overlay')) overlay.remove();
+    });
+
+    overlay.append(popup);
+    $('body').append(overlay);
+}
+
+// Wrapper for the command
+export async function analyzeAndShowArcs() {
+    try {
+        const arcs = await performArcAnalysis();
+        await showArcPopup(arcs);
+        return arcs ? `Found ${arcs.length} potential arcs.` : 'No arcs found.';
+    } catch (err) {
+        return `Error: ${err.message}`;
+    }
+}
+
+
+
+
+/**
+ * Generate a search query for retrieval using LLM
+ */
+async function generateRetrievalQuery(chatHistory) {
+    const prompt = settings.retrieval_query_prompt.replace('{{content}}', chatHistory);
+    try {
+        const result = await ConnectionManagerRequestService.sendRequest(
+            settings.summarization_profile,
+            [{ role: 'user', content: prompt }]
+        );
+        return (result?.content || result || '').trim();
+    } catch (err) {
+        console.error('Token Reducer: Retrieval query generation failed', err);
+        return null;
     }
 }

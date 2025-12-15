@@ -5,8 +5,8 @@
 import { extension_settings, getContext } from "../../../../extensions.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
 import { extension_name } from "../index.js";
-import { summarizeAllMessages, clearAllSummaries } from "./summarizer.js";
-import { getMemories, exportMemories, getChapterTimeline, loadTimelineData, removeChapter, updateChapter } from "./memory-manager.js";
+import { summarizeMessage, summarizeScene, summarizeAllMessages, clearAllSummaries } from "./summarizer.js";
+import { getMemories, exportMemories, getChapterTimeline, loadTimelineData, removeChapter, updateChapter, retrieveRelevantMemories } from "./memory-manager.js";
 import { updateTokenDisplay } from "./token-tracker.js";
 
 // Default settings - all features toggleable
@@ -30,15 +30,16 @@ const defaultSettings = {
     // Scene/Chapter Summarization
     enable_scene_mode: false,
     auto_detect_scenes: false,
+    auto_scene_interval: 0, // 0 = disabled, otherwise number of messages
     scene_button: true,
     hide_summarized_scenes: false,
 
     // Memory Storage
-    storage_mode: 'metadata', // 'metadata', 'lorebook', 'both'
+    storage_mode: 'lorebook', // 'metadata', 'lorebook', 'both' - Changed to lorebook for AI retrieval
     target_lorebook: '',
     auto_create_lorebook: true, // Auto-create lorebook if none exists
     lorebook_name_template: 'TR_Memories_{{char}}', // Template for auto-created lorebook name
-    lorebook_probability: 100,
+    lorebook_probability: 100, // 100% activation for reliable retrieval
     refresh_editor: true, // Refresh World Info panel after adding memories
     popup_memories: false,
     popup_probability: 10,
@@ -54,9 +55,10 @@ const defaultSettings = {
 
     // Smart Context Retrieval
     enable_smart_retrieval: false,
+    enable_llm_retrieval: false, // New: Active LLM-based query generation
     retrieval_on_send: false,
     max_retrieved_memories: 5,
-    retrieval_prompt: '',
+    retrieval_prompt: '', // Legacy static prompt (if any)
 
     // Generation Settings
     summarization_profile: '', // Connection profile ID for summarization
@@ -81,6 +83,48 @@ Keywords:`,
 {{content}}
 
 Scene Summary:`,
+
+    retrieval_query_prompt: `Given the following chat history, formulate a search query to find relevant past details in our memory bank. Return ONLY the search query.
+
+Chat History:
+{{content}}
+
+Search Query:`, // New prompt template
+
+    chapter_break_prompt: `Analyze the recent conversation and determine if this is a good point to end the current chapter/scene.
+A chapter break is appropriate if:
+1. A major event just concluded.
+2. The specialized topic of conversation has finished.
+3. Time has passed or locations have changed.
+
+Chat History:
+{{content}}
+
+Return your analysis in JSON format:
+{
+    "should_end": true/false,
+    "reasoning": "Brief explanation why"
+}`, // New prompt template
+
+    arc_analyzer_prompt_template: `Analyze the following chat history and identify potential "Story Arcs" or optimal points to end a chapter.
+Focus on moments where:
+1. A scene location changes.
+2. A significant time jump occurs.
+3. Examples of "emotional closure" or conflict resolution.
+4. A major plot point is revealed or resolved.
+
+Return a JSON ARRAY. Each item should be a potential chapter end:
+[
+  {
+    "title": "Short catchy title",
+    "summary": "One sentence summary of the arc.",
+    "justification": "Why this is a good break point.",
+    "chapterEnd": 123 // The ID of the message that ENDS this chapter
+  }
+]
+
+Chat History:
+{{chapterHistory}}`, // Robust prompt
 
     // Timeline Injection Settings
     enable_injection: false,
@@ -141,7 +185,7 @@ export function notify(type, message, title = 'Token Reducer') {
                 toastr.info(message, title);
         }
     } else {
-        console.log(`[${title}] ${type}: ${message}`);
+        console.log(`[${title}] ${type}: ${message} `);
     }
 }
 /**
@@ -225,6 +269,8 @@ function applySettingsToUI() {
     // Scene/Chapter Summarization
     $('#tr_enable_scene_mode').prop('checked', settings.enable_scene_mode);
     $('#tr_auto_detect_scenes').prop('checked', settings.auto_detect_scenes);
+    $('#tr_auto_scene_interval').val(settings.auto_scene_interval);
+    $('#tr_auto_scene_interval_value').text(settings.auto_scene_interval > 0 ? settings.auto_scene_interval : 'Off');
     $('#tr_scene_button').prop('checked', settings.scene_button);
     $('#tr_hide_summarized_scenes').prop('checked', settings.hide_summarized_scenes);
 
@@ -251,6 +297,7 @@ function applySettingsToUI() {
 
     // Smart Retrieval
     $('#tr_enable_smart_retrieval').prop('checked', settings.enable_smart_retrieval);
+    $('#tr_enable_llm_retrieval').prop('checked', settings.enable_llm_retrieval);
     $('#tr_retrieval_on_send').prop('checked', settings.retrieval_on_send);
     $('#tr_max_retrieved_memories').val(settings.max_retrieved_memories);
 
@@ -263,6 +310,10 @@ function applySettingsToUI() {
     $('#tr_summary_prompt').val(settings.summary_prompt);
     $('#tr_keywords_prompt').val(settings.keywords_prompt);
     $('#tr_scene_summary_prompt').val(settings.scene_summary_prompt);
+    $('#tr_retrieval_query_prompt').val(settings.retrieval_query_prompt);
+    $('#tr_retrieval_query_prompt').val(settings.retrieval_query_prompt);
+    $('#tr_chapter_break_prompt').val(settings.chapter_break_prompt);
+    $('#tr_arc_analyzer_prompt_template').val(settings.arc_analyzer_prompt_template);
 
     // Timeline Injection
     $('#tr_enable_injection').prop('checked', settings.enable_injection);
@@ -286,7 +337,7 @@ function bindSettingsHandlers() {
         'replace_with_summary', 'collapse_summarized', 'auto_hide_summarized',
         'enable_scene_mode', 'auto_detect_scenes', 'scene_button', 'hide_summarized_scenes',
         'popup_memories', 'auto_create_lorebook', 'refresh_editor', 'enable_threshold', 'summarize_oldest_first',
-        'aggressive_mode', 'show_token_counter', 'enable_smart_retrieval',
+        'aggressive_mode', 'show_token_counter', 'enable_smart_retrieval', 'enable_llm_retrieval',
         'retrieval_on_send', 'enable_injection'
     ];
 
@@ -314,14 +365,16 @@ function bindSettingsHandlers() {
     const ranges = [
         { name: 'popup_probability', suffix: '%' },
         { name: 'token_threshold_pct', suffix: '%' },
-        { name: 'injection_depth', suffix: '' }
+        { name: 'injection_depth', suffix: '' },
+        { name: 'auto_scene_interval', suffix: '' }
     ];
 
     ranges.forEach(({ name, suffix }) => {
         $(`#tr_${name}`).on('input', function () {
             const val = parseInt($(this).val());
             settings[name] = val;
-            $(`#tr_${name}_value`).text(val + suffix);
+            const displayVal = val === 0 && name === 'auto_scene_interval' ? 'Off' : val + suffix;
+            $(`#tr_${name}_value`).text(displayVal);
             saveSettings();
         });
     });
@@ -348,7 +401,7 @@ function bindSettingsHandlers() {
     });
 
     // Textarea handlers (prompts)
-    const textareas = ['summary_prompt', 'keywords_prompt', 'scene_summary_prompt', 'injection_template'];
+    const textareas = ['summary_prompt', 'keywords_prompt', 'scene_summary_prompt', 'injection_template', 'retrieval_query_prompt', 'chapter_break_prompt', 'arc_analyzer_prompt_template'];
 
     textareas.forEach(name => {
         $(`#tr_${name}`).on('input', function () {
@@ -362,6 +415,10 @@ function bindSettingsHandlers() {
         settings.summary_prompt = defaultSettings.summary_prompt;
         settings.keywords_prompt = defaultSettings.keywords_prompt;
         settings.scene_summary_prompt = defaultSettings.scene_summary_prompt;
+        settings.retrieval_query_prompt = defaultSettings.retrieval_query_prompt;
+        settings.retrieval_query_prompt = defaultSettings.retrieval_query_prompt;
+        settings.chapter_break_prompt = defaultSettings.chapter_break_prompt;
+        settings.arc_analyzer_prompt_template = defaultSettings.arc_analyzer_prompt_template;
         applySettingsToUI();
         saveSettings();
         notify("success", 'Prompts reset to defaults', 'Token Reducer');
@@ -564,6 +621,51 @@ function bindSettingsHandlers() {
             importPreset(json);
         }
     });
+
+    // Arc Analysis Button
+    $('#tr_run_arc_analysis').on('click', async function () {
+        const button = $(this);
+        button.prop('disabled', true).find('i').removeClass('fa-magic').addClass('fa-spinner fa-spin');
+        try {
+            const { analyzeAndShowArcs } = await import('./memory-manager.js');
+            await analyzeAndShowArcs();
+        } catch (err) {
+            console.error('Token Reducer: Arc Analysis failed:', err);
+            notify("error", 'Arc Analysis failed: ' + err.message, 'Token Reducer');
+        } finally {
+            button.prop('disabled', false).find('i').removeClass('fa-spinner fa-spin').addClass('fa-magic');
+        }
+    });
+
+    // Retroactive Fill Button
+    $('#tr_open_autofill_popup').on('click', async function () {
+        // Use a prompt to get the interval, reusing existing logic
+        const interval = await getContext().Popup.show.input(
+            'Retroactive Chapter Fill',
+            'Enter the message interval for creating chapters (e.g. 20):'
+        );
+        if (!interval) return;
+
+        const intVal = parseInt(interval);
+        if (isNaN(intVal) || intVal < 1) {
+            notify("error", "Invalid interval", "Token Reducer");
+            return;
+        }
+
+        const button = $(this);
+        button.prop('disabled', true).find('i').removeClass('fa-list-ol').addClass('fa-spinner fa-spin');
+        try {
+            const { autoFillChapters } = await import('./summarizer.js');
+            notify("info", `Starting auto-fill (Interval: ${intVal})...`, "Token Reducer");
+            await autoFillChapters(intVal);
+            notify("success", "Auto-fill complete!", "Token Reducer");
+        } catch (err) {
+            console.error('Token Reducer: Auto-fill failed:', err);
+            notify("error", 'Auto-fill failed: ' + err.message, 'Token Reducer');
+        } finally {
+            button.prop('disabled', false).find('i').removeClass('fa-spinner fa-spin').addClass('fa-list-ol');
+        }
+    });
 }
 
 /**
@@ -661,6 +763,7 @@ function updateDependentSettings() {
 
     // Scene settings depend on scene mode
     $('#tr_auto_detect_scenes').closest('.tr-setting-row').toggle(settings.enable_scene_mode);
+    $('#tr_auto_scene_interval').closest('.tr-setting-row').toggle(settings.enable_scene_mode);
     $('#tr_scene_button').closest('.tr-setting-row').toggle(settings.enable_scene_mode);
     $('#tr_hide_summarized_scenes').closest('.tr-setting-row').toggle(settings.enable_scene_mode);
 
@@ -681,6 +784,7 @@ function updateDependentSettings() {
 
     // Smart retrieval settings
     $('#tr_retrieval_on_send').closest('.tr-setting-row').toggle(settings.enable_smart_retrieval);
+    $('#tr_enable_llm_retrieval').closest('.tr-setting-row').toggle(settings.enable_smart_retrieval);
     $('#tr_max_retrieved_memories').closest('.tr-setting-row').toggle(settings.enable_smart_retrieval);
 }
 

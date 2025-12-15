@@ -4,9 +4,9 @@
 
 import { getContext } from "../../../../extensions.js";
 import { settings } from "./settings.js";
-import { summarizeMessage, summarizeScene, summarizeAllMessages, clearAllSummaries, findLastSceneEnd } from "./summarizer.js";
+import { summarizeMessage, summarizeScene, summarizeAllMessages, clearAllSummaries, findLastSceneEnd, autoFillChapters } from "./summarizer.js";
 import { getTotalSavings, updateTokenDisplay } from "./token-tracker.js";
-import { retrieveRelevantMemories, getTimeline, exportMemories } from "./memory-manager.js";
+import { retrieveRelevantMemories, getTimeline, exportMemories, analyzeAndShowArcs } from "./memory-manager.js";
 
 /**
  * Register slash commands
@@ -59,6 +59,21 @@ export function loadSlashCommands() {
         helpString: 'Summarize a specific message by ID. Example: /tr-summarize 10'
     }));
 
+    // /tr-analyze - Suggest chapter breaks
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'tr-analyze',
+        callback: async () => {
+            try {
+                const result = await analyzeAndShowArcs();
+                return result;
+            } catch (err) {
+                return `Error: ${err.message}`;
+            }
+        },
+        aliases: ['tra'],
+        helpString: 'Analyze recent conversation for potential chapter breaks (Active Arc Analysis)'
+    }));
+
     // /tr-scene-end - End scene at a message
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'tr-scene-end',
@@ -95,6 +110,42 @@ export function loadSlashCommands() {
             })
         ],
         helpString: 'End scene at a specific message, summarizing from the last scene end. Example: /tr-scene-end 25'
+    }));
+
+    // /tr-autofill - Retroactively fill missing chapters
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'tr-autofill',
+        callback: async (args, value) => {
+            const interval = parseInt(value || args.interval);
+            if (isNaN(interval) || interval < 5) {
+                return 'Error: Please provide a valid interval (minimum 5 messages). Example: /tr-autofill 20';
+            }
+
+            try {
+                const count = await autoFillChapters(interval);
+                updateTokenDisplay();
+                return `Auto-fill complete: Created ${count} chapters.`;
+            } catch (err) {
+                return `Error: ${err.message}`;
+            }
+        },
+        aliases: ['traf'],
+        namedArgumentList: [
+            SlashCommandArgument.fromProps({
+                name: 'interval',
+                description: 'Number of messages per chapter (min 5)',
+                typeList: [ARGUMENT_TYPE.NUMBER],
+                isRequired: true
+            })
+        ],
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({
+                description: 'Number of messages per chapter (min 5)',
+                typeList: [ARGUMENT_TYPE.NUMBER],
+                isRequired: true
+            })
+        ],
+        helpString: 'Automatically fill missing chapters with a set interval. Example: /tr-autofill 20'
     }));
 
     // /tr-status - Show token savings stats

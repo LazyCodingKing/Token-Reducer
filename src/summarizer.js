@@ -468,19 +468,31 @@ export async function clearAllSummaries() {
 
     let cleared = 0;
 
-    for (const msg of chat) {
+    for (let i = 0; i < chat.length; i++) {
+        const msg = chat[i];
         if (msg.extra) {
+            let modified = false;
+
             if (msg.extra.tr_summary) {
                 delete msg.extra.tr_summary;
-                delete msg.extra.tr_summarized_at;
+                if (msg.extra.tr_summarized_at) delete msg.extra.tr_summarized_at;
+                modified = true;
                 cleared++;
             }
             if (msg.extra.tr_scene_summary) {
                 delete msg.extra.tr_scene_end;
                 delete msg.extra.tr_scene_summary;
                 delete msg.extra.tr_scene_start;
-                delete msg.extra.tr_summarized_at;
+                if (msg.extra.tr_summarized_at) delete msg.extra.tr_summarized_at;
+                modified = true;
                 cleared++;
+            }
+
+            // Restore visibility if it was hidden by us
+            if (modified && msg.is_system && msg.extra.tr_summary) {
+                // If it was hidden because of summary, unhide it?
+                // Actually, logic for unhiding is complex because user might have hidden manually.
+                // For now just clearing the meta.
             }
         }
     }
@@ -493,4 +505,77 @@ export async function clearAllSummaries() {
     }
 
     return cleared;
+}
+
+/**
+ * Automatically fill missing chapters based on interval
+ * @param {number} interval - Number of messages per chapter
+ */
+export async function autoFillChapters(interval) {
+    if (!interval || interval < 5) throw new Error('Interval must be at least 5 messages');
+
+    const context = getContext();
+    const chat = context.chat;
+    let created = 0;
+
+    notify("info", `Auto-filling chapters (interval: ${interval})...`, 'Token Reducer');
+
+    let processedCount = 0;
+    let lastSceneEnd = -1;
+
+    // Find the last existing scene end to start from
+    for (let i = 0; i < chat.length; i++) {
+        if (chat[i]?.extra?.tr_scene_end) {
+            lastSceneEnd = i;
+        }
+    }
+
+    // If no scenes exist, start from beginning. If scenes exist, start from last scene + 1
+    let startScan = lastSceneEnd + 1;
+
+    // We need to look for blocks of 'interval' size
+    // But we iterate message by message
+    let currentBlockStart = startScan;
+
+    while (currentBlockStart < chat.length) {
+        // Calculate potential end of this block
+        let potentialEnd = currentBlockStart + interval - 1;
+
+        // If we are near the end of chat, check if we have enough messages
+        if (potentialEnd >= chat.length) {
+            break; // Not enough messages for a full chapter
+        }
+
+        // Check if there's an existing scene end within this block (shouldn't be, if we logic right)
+        // But let's be safe.
+        let hitExisting = false;
+        for (let j = currentBlockStart; j <= potentialEnd; j++) {
+            if (chat[j]?.extra?.tr_scene_end) {
+                currentBlockStart = j + 1;
+                hitExisting = true;
+                break;
+            }
+        }
+
+        if (hitExisting) continue;
+
+        // Found a block! Summarize it.
+        try {
+            await summarizeScene(currentBlockStart, potentialEnd);
+            created++;
+            currentBlockStart = potentialEnd + 1;
+        } catch (err) {
+            console.error(`Token Reducer: Failed to auto-fill chapter at ${currentBlockStart}-${potentialEnd}:`, err);
+            // Skip this block to avoid infinite loop if error persists
+            currentBlockStart++;
+        }
+    }
+
+    if (created > 0) {
+        notify("success", `Created ${created} missing chapters`, 'Token Reducer');
+    } else {
+        notify("info", 'No missing chapters found to fill', 'Token Reducer');
+    }
+
+    return created;
 }
