@@ -147,6 +147,22 @@
                         <small>AI automatically detects natural scene breaks</small>
                     </div>
                     <div class="tr-setting-row">
+                        <label for="tr_auto_scene_interval">Auto-Detect Interval (messages): <span
+                                id="tr_auto_scene_interval_value">Off</span></label>
+                        <input type="range" id="tr_auto_scene_interval" min="0" max="50" value="0">
+                        <small>0 = Off. Automatically create chapter every N messages.</small>
+                    </div>
+                    <div class="tr-setting-row">
+                        <button id="tr_run_arc_analysis" class="menu_button">
+                            <i class="fa-solid fa-magic"></i> Run Arc Analysis
+                        </button>
+                    </div>
+                    <div class="tr-setting-row">
+                        <button id="tr_open_autofill_popup" class="menu_button">
+                            <i class="fa-solid fa-list-ol"></i> Retroactive Chapter Fill
+                        </button>
+                    </div>
+                    <div class="tr-setting-row">
                         <label for="tr_scene_button">
                             <input type="checkbox" id="tr_scene_button">
                             Show Scene Button
@@ -368,6 +384,11 @@
                         <label for="tr_scene_summary_prompt">Scene Summary Prompt:</label>
                         <textarea id="tr_scene_summary_prompt" rows="4"
                             placeholder="Use {{content}} for the scene content"></textarea>
+                    </div>
+                    <div class="tr-setting-row">
+                        <label for="tr_arc_analyzer_prompt_template">Arc Analyzer Prompt:</label>
+                        <textarea id="tr_arc_analyzer_prompt_template" rows="10"
+                            placeholder="Prompt for Arc Analysis (JSON output)"></textarea>
                     </div>
                     <div class="tr-setting-row">
                         <button id="tr_reset_prompts" class="menu_button">

@@ -17,6 +17,8 @@ export const extension_path = `scripts/extensions/third-party/${extension_name}`
 const TIMELINE_INJECT_KEY = 'tr_timeline_injection';
 
 let STVersion;
+let lastSwipeId = null;
+let lastMessageId = null;
 
 /**
  * Check SillyTavern version compatibility
@@ -48,6 +50,12 @@ async function onGenerationStarted() {
  * Uses setExtensionPrompt to inject timeline at the configured depth
  */
 export function updateTimelineInjection() {
+    // Check if settings loaded
+    if (!settings) {
+        console.warn('Token Reducer: Settings not loaded yet, skipping timeline injection');
+        return;
+    }
+
     // Clear injection if disabled
     if (!settings.enable_injection) {
         setExtensionPrompt(TIMELINE_INJECT_KEY, '', extension_prompt_types.IN_CHAT, 0);
@@ -106,42 +114,65 @@ async function onCharacterMessageRendered(mesId) {
 
     // Handle Swipe Re-summarization
     if (lastSwipeId === currentMessageIndex) {
-        lastSwipeId = null;
-        if (settings.auto_summarize_on_swipe) {
+        if (settings.enable_message_summary && settings.auto_summarize_on_swipe) {
+            lastSwipeId = null;
             console.log('Token Reducer: Swipe detected, re-summarizing:', mesId);
-            const { summarizeMessage } = await import('./src/summarizer.js');
-            await summarizeMessage(mesId);
-            onMessageRendered(mesId);
+            try {
+                const { summarizeMessage } = await import('./src/summarizer.js');
+                await summarizeMessage(mesId);
+                onMessageRendered(mesId);
+            } catch (err) {
+                console.error('Token Reducer: Failed to load summarizer on swipe:', err);
+            }
             return; // Exit after swipe processing
         }
+        lastSwipeId = null;
     }
 
     // Handle Continue Re-summarization
-    if (lastMessageId === currentMessageIndex && settings.auto_summarize_on_continue) {
+    if (lastMessageId === currentMessageIndex && settings.enable_message_summary && settings.auto_summarize_on_continue) {
         if (chat[mesId].extra?.tr_summary) {
             console.log('Token Reducer: Continue detected, re-summarizing:', mesId);
-            const { summarizeMessage } = await import('./src/summarizer.js');
-            await summarizeMessage(mesId);
-            onMessageRendered(mesId);
+            try {
+                const { summarizeMessage } = await import('./src/summarizer.js');
+                await summarizeMessage(mesId);
+                onMessageRendered(mesId);
+            } catch (err) {
+                console.error('Token Reducer: Failed to load summarizer on continue:', err);
+            }
             return; // Exit after continue processing
         }
     }
 
     lastMessageId = currentMessageIndex;
 
+    // Auto-Scene Creation (Every N messages)
+    if (settings.enable_scene_mode && settings.auto_scene_interval > 0) {
+        try {
+            const { findLastSceneEnd, summarizeScene } = await import('./src/summarizer.js');
+            const lastEnd = findLastSceneEnd(currentMessageIndex);
+
+            // Calculate messages since last scene end (excluding system messages ideally, but index diff is a good proxy for now)
+            const count = currentMessageIndex - lastEnd;
+
+            if (count >= settings.auto_scene_interval) {
+                console.log(`Token Reducer: Auto-scene interval reached (${count} messages). Creating chapter...`);
+                // Summarize from lastEnd + 1 to current
+                await summarizeScene(lastEnd + 1, currentMessageIndex);
+            }
+        } catch (err) {
+            console.error('Token Reducer: Error in auto-scene creation:', err);
+        }
+    }
+
     // Auto-summarize old messages if enabled
     if (settings.enable_message_summary && settings.auto_summarize) {
         try {
             const delay = settings.summary_delay_messages || 5;
-            const currentMessageIndex = parseInt(mesId);
+            const oldestToSummarize = currentMessageIndex - delay;
 
             // Find messages that need summarizing (older than delay)
-            for (let i = 0; i < chat.length; i++) {
-                const messagesFromCurrent = currentMessageIndex - i;
-
-                // Skip if message is within the delay window
-                if (messagesFromCurrent < delay) continue;
-
+            for (let i = 0; i < oldestToSummarize && i < chat.length; i++) {
                 // Skip if already summarized
                 if (chat[i].extra?.tr_summary) continue;
 
@@ -152,12 +183,15 @@ async function onCharacterMessageRendered(mesId) {
                 if (chat[i].is_user && !settings.auto_summarize_user) continue;
 
                 // Summarize this message
-                console.log(`Token Reducer: Auto-summarizing message ${i} (${messagesFromCurrent} messages old)`);
-                const { summarizeMessage } = await import('./src/summarizer.js');
-                await summarizeMessage(i);
-
-                // Update UI for the summarized message
-                onMessageRendered(i);
+                console.log(`Token Reducer: Auto-summarizing message ${i} (${currentMessageIndex - i} messages old)`);
+                try {
+                    const { summarizeMessage } = await import('./src/summarizer.js');
+                    await summarizeMessage(i);
+                    // Update UI for the summarized message
+                    onMessageRendered(i);
+                } catch (err) {
+                    console.error(`Token Reducer: Failed to summarize message ${i}:`, err);
+                }
             }
         } catch (err) {
             console.error('Token Reducer: Error in auto-summarize:', err);
@@ -216,14 +250,18 @@ jQuery(async () => {
 
         // Edit Handler
         eventSource.on(event_types.MESSAGE_EDITED, async (mesId) => {
-            if (!settings.auto_summarize_on_edit) return;
+            if (!settings.enable_message_summary || !settings.auto_summarize_on_edit) return;
             const context = getContext();
             const message = context.chat[mesId];
             if (message?.extra?.tr_summary) {
                 console.log('Token Reducer: Message edited, re-summarizing:', mesId);
-                const { summarizeMessage } = await import('./src/summarizer.js');
-                await summarizeMessage(mesId);
-                onMessageRendered(mesId);
+                try {
+                    const { summarizeMessage } = await import('./src/summarizer.js');
+                    await summarizeMessage(mesId);
+                    onMessageRendered(mesId);
+                } catch (err) {
+                    console.error('Token Reducer: Failed to load summarizer on edit:', err);
+                }
             }
         });
 
@@ -237,5 +275,3 @@ jQuery(async () => {
     }
 });
 
-let lastSwipeId = null;
-let lastMessageId = null;
