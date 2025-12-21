@@ -1,3 +1,5 @@
+Work in progress, it might not work well
+
 # SillyTavern Token Reducer
 MADE USING GOOGLE ANTIGRAVITY BASED ON POPULAR MEMORY EXTENSIONS FOR PERSONAL USE
 
